@@ -20,18 +20,6 @@ from .common import (BRAND, driver_label, resolve_division,
                      render_case_embed, update_organised_card)
 
 
-async def driver_autocomplete(interaction: discord.Interaction, current: str):
-    div = resolve_division(interaction)
-    division_id = div["id"] if div else None
-    drivers = database.list_drivers(interaction.guild_id, division_id=division_id)
-    out = []
-    for d in drivers:
-        label = f"#{d['number']} {d['name']}" if d["number"] is not None else d["name"]
-        if current.lower() in label.lower():
-            out.append(app_commands.Choice(name=label[:100], value=str(d["id"])))
-    return out[:25]
-
-
 class ReportModal(discord.ui.Modal, title="Incident report"):
     lap = discord.ui.TextInput(label="Lap", placeholder="e.g. 12", required=True, max_length=20)
     corner = discord.ui.TextInput(label="Corner (optional)", required=False, max_length=40)
@@ -145,9 +133,8 @@ class Incidents(commands.Cog):
     incident = app_commands.Group(name="incident", description="Report and defend incidents")
 
     @incident.command(name="report", description="Report an incident against another driver.")
-    @app_commands.describe(against="The driver you are reporting (name / number)")
-    @app_commands.autocomplete(against=driver_autocomplete)
-    async def report(self, interaction: discord.Interaction, against: str):
+    @app_commands.describe(against="The driver you're reporting — pick their Discord @")
+    async def report(self, interaction: discord.Interaction, against: discord.Member):
         div = resolve_division(interaction)
         if not div:
             await interaction.response.send_message(
@@ -155,14 +142,14 @@ class Incidents(commands.Cog):
                 "reports channel, or ask an admin to register your driver profile with `/driver register`.",
                 ephemeral=True)
             return
-        accused = database.find_driver(interaction.guild_id, against, division_id=div["id"]) \
-            or database.find_driver(interaction.guild_id, against)
+        gid = interaction.guild_id
+        # Find the reported driver by their Discord member; if they aren't
+        # registered yet, add them to this channel's division automatically.
+        accused = database.find_driver(gid, str(against.id))
         if not accused:
-            await interaction.response.send_message(
-                f"Couldn't find a driver matching `{against}`. Make sure they're registered "
-                f"(`/driver register`). Rule 15K requires the reported driver to be tagged.",
-                ephemeral=True)
-            return
+            new_id = database.add_driver(gid, against.display_name, None, None, None, None,
+                                         division_id=div["id"], user_id=against.id)
+            accused = database.get_driver(gid, new_id)
         await interaction.response.send_modal(ReportModal(div, accused))
 
     @incident.command(name="defend", description="Submit a defence for an incident reported against you.")
