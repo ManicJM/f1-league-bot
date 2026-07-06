@@ -1,0 +1,22 @@
+[Unit]
+Description=F1 League Stewarding Discord Bot
+# Wait until the server has network before starting
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# The Linux user the bot runs as (created during setup)
+User=f1bot
+WorkingDirectory=/home/f1bot/f1-league-bot
+# Run the bot using the Python inside the project's virtual environment
+ExecStart=/home/f1bot/f1-league-bot/.venv/bin/python bot.py
+# If the bot ever crashes, restart it automatically after 5 seconds
+Restart=always
+RestartSec=5
+# Send the bot's logs to the system journal (view with: journalctl -u f1-league-bot)
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
