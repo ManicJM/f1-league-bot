@@ -40,8 +40,10 @@ def driver_label(driver):
     if not driver:
         return "Unknown driver"
     num = f"#{driver['number']} " if driver["number"] is not None else ""
-    mention = f" (<@{driver['user_id']}>)" if driver["user_id"] else ""
-    return f"{num}{driver['name']}{mention}"
+    # Prefer the Discord mention (server tag) so the driver shows tagged.
+    if driver["user_id"]:
+        return f"{num}<@{driver['user_id']}>".strip()
+    return f"{num}{driver['name']}".strip()
 
 
 def _row_get(row, key):
