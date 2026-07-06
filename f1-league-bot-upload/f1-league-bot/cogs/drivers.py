@@ -1,137 +1,147 @@
-"""Shared helpers used across the command modules."""
+"""Driver directory: registration, roster, profiles."""
 import discord
+from discord import app_commands
+from discord.ext import commands
 
 import database
-
-# League brand colour for embeds
-BRAND = discord.Color.from_rgb(225, 6, 0)   # F1 red
+from .common import BRAND, driver_label
 
 
-def resolve_division(interaction):
-    """Figure out which division a command is acting on.
-
-    Priority:
-      1) the channel the command was used in (if it's a division's reports channel)
-      2) the division of the command user's registered driver profile
-    Returns a division row, or None if it can't be determined.
-    """
-    gid = interaction.guild_id
-    div = database.division_for_channel(gid, interaction.channel_id)
-    if div:
-        return div
-    driver = database.find_driver(gid, str(interaction.user.id))
-    if driver and driver["division_id"]:
-        return database.get_division(gid, driver["division_id"])
-    return None
+PLATFORMS = [
+    app_commands.Choice(name="PC", value="PC"),
+    app_commands.Choice(name="PlayStation", value="PlayStation"),
+    app_commands.Choice(name="Xbox", value="Xbox"),
+]
 
 
-def is_steward_for(interaction, division):
-    """True if the user may act as a steward for this division:
-    they have the division's steward role, or they have manage-guild permission."""
-    if interaction.user.guild_permissions.manage_guild:
-        return True
-    if division and division["steward_role_id"]:
-        role_ids = {str(r.id) for r in getattr(interaction.user, "roles", [])}
-        return str(division["steward_role_id"]) in role_ids
-    return False
+async def division_autocomplete(interaction: discord.Interaction, current: str):
+    divs = database.list_divisions(interaction.guild_id)
+    return [
+        app_commands.Choice(name=d["name"], value=str(d["id"]))
+        for d in divs if current.lower() in d["name"].lower()
+    ][:25]
 
 
-def driver_label(driver):
-    if not driver:
-        return "Unknown driver"
-    num = f"#{driver['number']} " if driver["number"] is not None else ""
-    # Prefer the Discord mention (server tag) so the driver shows tagged.
-    if driver["user_id"]:
-        return f"{num}<@{driver['user_id']}>".strip()
-    return f"{num}{driver['name']}".strip()
+class Drivers(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
 
+    driver = app_commands.Group(name="driver", description="Driver directory")
 
-def _row_get(row, key):
-    """Safely read a column that may not exist on older rows."""
-    try:
-        return row[key]
-    except (KeyError, IndexError):
-        return None
-
-
-def render_case_embed(guild_id, incident):
-    """Build the single consolidated 'case card': report + every defence +
-    the final decision, all in one embed. Used for the organised-channel card
-    and for /incident view so both always look identical."""
-    accused = database.get_driver(guild_id, incident["accused_driver_id"]) if incident["accused_driver_id"] else None
-    defences = database.get_defences(incident["id"])
-    verdict = database.get_verdict_for_incident(guild_id, incident["id"])
-    closed = incident["status"] == "closed" or verdict is not None
-
-    color = discord.Color.green() if verdict else discord.Color.orange()
-    status = "⚫ Closed" if closed else "🟠 Open — awaiting steward decision"
-    embed = discord.Embed(
-        title=f"Case #{incident['case_number']} — {status}",
-        color=color,
-        description=incident["description"] or "—",
+    @driver.command(name="register", description="Register a driver — just their @ and division.")
+    @app_commands.describe(
+        member="The driver (pick their Discord @)",
+        division="Which division/tier they race in",
     )
-    embed.add_field(name="Reported by",
-                    value=f"<@{incident['reporter_id']}>" if incident["reporter_id"] else "—", inline=True)
-    embed.add_field(name="Accused", value=driver_label(accused), inline=True)
-    embed.add_field(name="Lap / Corner",
-                    value=f"{incident['lap']} / {incident['corner'] or '—'}", inline=True)
-    if incident["footage_url"]:
-        embed.add_field(name="📹 Report footage", value=incident["footage_url"], inline=False)
+    @app_commands.autocomplete(division=division_autocomplete)
+    async def register(self, interaction: discord.Interaction,
+                       member: discord.Member, division: str):
+        gid = interaction.guild_id
+        div = database.find_division(gid, division)
+        if not div:
+            await interaction.response.send_message(
+                "Couldn't find that division. Pick one from the list, or set it up first with `/division add`.",
+                ephemeral=True)
+            return
+        # The driver's name is taken from their Discord display name automatically.
+        existing = database.find_driver(gid, str(member.id))
+        if existing:
+            database.update_driver(gid, existing["id"], division_id=div["id"], name=member.display_name)
+            action = "updated"
+        else:
+            database.add_driver(gid, member.display_name, None, None, None, None,
+                                division_id=div["id"], user_id=member.id)
+            action = "registered"
+        embed = discord.Embed(title=f"✅ Driver {action}", color=BRAND)
+        embed.add_field(name="Driver", value=member.mention, inline=True)
+        embed.add_field(name="Division", value=div["name"], inline=True)
+        await interaction.response.send_message(embed=embed)
 
-    if defences:
-        for d in defences:
-            val = d["description"] or "—"
-            if d["footage_url"]:
-                val += f"\n📹 Footage: {d['footage_url']}"
-            who = f"<@{d['submitter_id']}>" if d["submitter_id"] else "driver"
-            embed.add_field(name=f"🔵 Defence by {who}", value=val, inline=False)
-    else:
-        embed.add_field(name="🔵 Defence", value="_none submitted yet_", inline=False)
+    @driver.command(name="list", description="Show the driver roster (optionally for one division).")
+    @app_commands.describe(division="Filter to a division/tier")
+    @app_commands.autocomplete(division=division_autocomplete)
+    async def list_drivers(self, interaction: discord.Interaction, division: str = None):
+        gid = interaction.guild_id
+        division_id = int(division) if division and division.isdigit() else None
+        drivers = database.list_drivers(gid, division_id=division_id)
+        if not drivers:
+            await interaction.response.send_message("No drivers registered yet.", ephemeral=True)
+            return
+        lines = []
+        for d in drivers:
+            num = f"`#{d['number']:>2}`" if d["number"] is not None else "`  —`"
+            team = f" — {d['team']}" if d["team"] else ""
+            divn = f" _{d['division_name']}_" if d["division_name"] else ""
+            lines.append(f"{num} **{d['name']}**{team}{divn}")
+        title = "Driver roster"
+        if division_id:
+            div = database.get_division(gid, division_id)
+            if div:
+                title += f" — {div['name']}"
+        # Discord embed descriptions cap at 4096 chars; chunk if needed.
+        chunks, cur = [], ""
+        for line in lines:
+            if len(cur) + len(line) + 1 > 3900:
+                chunks.append(cur)
+                cur = ""
+            cur += line + "\n"
+        chunks.append(cur)
+        await interaction.response.send_message(
+            embed=discord.Embed(title=title, color=BRAND, description=chunks[0]))
+        for extra in chunks[1:]:
+            await interaction.followup.send(embed=discord.Embed(color=BRAND, description=extra))
 
-    if verdict:
-        pen = format_penalty(verdict["seconds"], verdict["points"], verdict["ban"])
-        decision = f"**{verdict['rule_code'] or '—'}** — {pen}"
-        if verdict["notes"]:
-            decision += f"\n_{verdict['notes']}_"
-        embed.add_field(name="⚖️ Decision", value=decision, inline=False)
+    @driver.command(name="profile", description="Show a driver's profile and penalty-point status.")
+    @app_commands.describe(driver="Name, number or @mention of the driver")
+    async def profile(self, interaction: discord.Interaction, driver: str):
+        gid = interaction.guild_id
+        d = database.find_driver(gid, driver)
+        if not d:
+            await interaction.response.send_message(
+                f"Couldn't find a single driver matching `{driver}`. Try their car number or exact name.",
+                ephemeral=True)
+            return
+        season = database.current_season(gid)
+        pts = database.driver_points(gid, d["id"], d["division_id"], season)
+        div = database.get_division(gid, d["division_id"]) if d["division_id"] else None
+        embed = discord.Embed(title=f"Driver profile — {driver_label(d)}", color=BRAND)
+        embed.add_field(name="Team", value=d["team"] or "—", inline=True)
+        embed.add_field(name="Division", value=div["name"] if div else "—", inline=True)
+        embed.add_field(name="Gamertag", value=d["gamertag"] or "—", inline=True)
+        embed.add_field(name="Platform", value=d["platform"] or "—", inline=True)
+        embed.add_field(name=f"Penalty points (S{season})", value=f"**{pts}**", inline=True)
+        appeals = database.appeals_used(gid, d["id"], d["division_id"], season)
+        embed.add_field(name="Appeals used", value=f"{appeals}/2", inline=True)
+        await interaction.response.send_message(embed=embed)
 
-    embed.set_footer(text=f"Case #{incident['case_number']} • season {incident['season']}")
-    return embed
-
-
-async def update_organised_card(guild, guild_id, division, incident):
-    """Create or edit the single consolidated case card in the division's
-    organised (stewards) channel. Returns the channel it lives in, or None."""
-    if not (division and division["organised_channel_id"]):
-        return None
-    org = guild.get_channel(int(division["organised_channel_id"]))
-    if org is None:
-        return None
-
-    embed = render_case_embed(guild_id, incident)
-    msg_id = _row_get(incident, "organised_message_id")
-    if msg_id:
-        try:
-            msg = await org.fetch_message(int(msg_id))
-            await msg.edit(embed=embed)
-            return org
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-            pass  # message deleted or unreachable — fall through and repost
-
-    msg = await org.send(
-        content=f"🗂️ **Case #{incident['case_number']}** — report & defences together (updates as new info arrives).",
-        embed=embed,
+    @driver.command(name="edit", description="Edit a driver's details.")
+    @app_commands.describe(
+        driver="Name, number or @mention of the driver to edit",
+        name="New name", number="New car number", division="New division",
+        team="New team", gamertag="New gamertag", platform="New platform",
     )
-    database.set_incident_organised_message(incident["id"], org.id, msg.id)
-    return org
+    @app_commands.autocomplete(division=division_autocomplete)
+    @app_commands.choices(platform=PLATFORMS)
+    async def edit(self, interaction: discord.Interaction, driver: str,
+                   name: str = None, number: app_commands.Range[int, 0, 999] = None,
+                   division: str = None, team: str = None, gamertag: str = None,
+                   platform: app_commands.Choice[str] = None):
+        gid = interaction.guild_id
+        d = database.find_driver(gid, driver)
+        if not d:
+            await interaction.response.send_message(
+                f"Couldn't find a single driver matching `{driver}`.", ephemeral=True)
+            return
+        division_id = int(division) if division and division.isdigit() else None
+        database.update_driver(
+            gid, d["id"], name=name, number=number, division_id=division_id,
+            team=team, gamertag=gamertag,
+            platform=platform.value if platform else None,
+        )
+        await interaction.response.send_message(
+            f"Updated **{name or d['name']}**. Per rule 11D, moving a driver's division keeps their penalty points.",
+            ephemeral=True)
 
 
-def format_penalty(seconds, points, ban):
-    parts = []
-    if seconds:
-        parts.append(f"**{seconds}s** time penalty")
-    if points:
-        parts.append(f"**{points}** penalty point{'s' if points != 1 else ''}")
-    if ban:
-        parts.append(f"**{ban.capitalize()} ban**")
-    return ", ".join(parts) if parts else "No further action"
+async def setup(bot):
+    await bot.add_cog(Drivers(bot))
