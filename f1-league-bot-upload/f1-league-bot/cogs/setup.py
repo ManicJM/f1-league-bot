@@ -10,6 +10,14 @@ import database
 from .common import BRAND
 
 
+async def division_autocomplete(interaction: discord.Interaction, current: str):
+    divs = database.list_divisions(interaction.guild_id)
+    return [
+        app_commands.Choice(name=d["name"], value=str(d["id"]))
+        for d in divs if current.lower() in d["name"].lower()
+    ][:25]
+
+
 class Setup(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -50,6 +58,36 @@ class Setup(commands.Cog):
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
+    @division.command(name="addsteward", description="Add another steward role to a tier.")
+    @app_commands.describe(division="The tier", role="The role to add as stewards")
+    @app_commands.autocomplete(division=division_autocomplete)
+    async def addsteward(self, interaction: discord.Interaction, division: str, role: discord.Role):
+        gid = interaction.guild_id
+        div = database.find_division(gid, division)
+        if not div:
+            await interaction.response.send_message(
+                "Couldn't find that division. Try `/division list`.", ephemeral=True)
+            return
+        ids = database.add_steward_role(gid, div["id"], role.id)
+        mentions = ", ".join(f"<@&{r}>" for r in ids)
+        await interaction.response.send_message(
+            f"✅ Stewards for **{div['name']}** are now: {mentions}", ephemeral=True)
+
+    @division.command(name="removesteward", description="Remove a steward role from a tier.")
+    @app_commands.describe(division="The tier", role="The role to remove")
+    @app_commands.autocomplete(division=division_autocomplete)
+    async def removesteward(self, interaction: discord.Interaction, division: str, role: discord.Role):
+        gid = interaction.guild_id
+        div = database.find_division(gid, division)
+        if not div:
+            await interaction.response.send_message(
+                "Couldn't find that division. Try `/division list`.", ephemeral=True)
+            return
+        ids = database.remove_steward_role(gid, div["id"], role.id)
+        mentions = ", ".join(f"<@&{r}>" for r in ids) if ids else "_none left_"
+        await interaction.response.send_message(
+            f"✅ Stewards for **{div['name']}** are now: {mentions}", ephemeral=True)
+
     @division.command(name="list", description="List all divisions and their settings.")
     async def list_divisions(self, interaction: discord.Interaction):
         divs = database.list_divisions(interaction.guild_id)
@@ -59,11 +97,12 @@ class Setup(commands.Cog):
             return
         lines = []
         for d in divs:
-            role = f"<@&{d['steward_role_id']}>" if d["steward_role_id"] else "_no role_"
+            role_ids = database.get_steward_role_ids(interaction.guild_id, d["id"])
+            roles = ", ".join(f"<@&{r}>" for r in role_ids) if role_ids else "_no roles_"
             chan = f"<#{d['reports_channel_id']}>" if d["reports_channel_id"] else "_no channel_"
             org = f" · organised <#{d['organised_channel_id']}>" if d["organised_channel_id"] else ""
             dec = f" · decisions <#{d['decisions_channel_id']}>" if d["decisions_channel_id"] else ""
-            lines.append(f"**{d['name']}** (id {d['id']}): stewards {role}, reports {chan}{org}{dec}")
+            lines.append(f"**{d['name']}** (id {d['id']}): stewards {roles}, reports {chan}{org}{dec}")
         embed = discord.Embed(title="Divisions", color=BRAND, description="\n".join(lines))
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
