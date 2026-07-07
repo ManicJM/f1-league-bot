@@ -32,20 +32,23 @@ class Steward(commands.Cog):
 
     steward = app_commands.Group(name="steward", description="Steward actions")
 
-    @steward.command(name="verdict", description="Issue a verdict on an incident.")
+    @steward.command(name="verdict", description="Issue a verdict on an incident (stack up to 3 rules).")
     @app_commands.describe(
         case="The case number being ruled on",
-        rule="The rulebook code being applied (auto-fills the standard penalty)",
+        rule="The main rulebook code (auto-fills the standard penalty)",
+        rule2="A second rule to stack on top (e.g. 3A reckless) — optional",
+        rule3="A third rule to stack — optional",
         driver="Who to penalise (defaults to the accused driver in the case)",
-        seconds="Override the time penalty in seconds",
-        points="Override the penalty points",
-        ban="Override the ban outcome",
+        seconds="Override the TOTAL time penalty in seconds",
+        points="Override the TOTAL penalty points",
+        ban="Add or override a ban outcome",
         final_race="Apply end-of-season scaling (rule 11C: time ×150%, PP-only becomes +5s)",
         notes="Extra notes / reasoning for the write-up",
     )
-    @app_commands.autocomplete(rule=rule_autocomplete)
+    @app_commands.autocomplete(rule=rule_autocomplete, rule2=rule_autocomplete, rule3=rule_autocomplete)
     @app_commands.choices(ban=BAN_CHOICES)
     async def verdict(self, interaction: discord.Interaction, case: int, rule: str,
+                      rule2: str = None, rule3: str = None,
                       driver: str = None, seconds: int = None, points: int = None,
                       ban: app_commands.Choice[str] = None, final_race: bool = False,
                       notes: str = None):
@@ -72,32 +75,48 @@ class Steward(commands.Cog):
                 "Couldn't determine which driver to penalise. Pass the `driver` option.", ephemeral=True)
             return
 
-        rule_obj = rules.get_rule(rule)
-        if not rule_obj:
-            await interaction.response.send_message(
-                f"Unknown rule code `{rule}`. Pick one from the autocomplete list.", ephemeral=True)
-            return
+        # Resolve every selected rule.
+        selected = []
+        for code in (rule, rule2, rule3):
+            if not code:
+                continue
+            r = rules.get_rule(code)
+            if not r:
+                await interaction.response.send_message(
+                    f"Unknown rule code `{code}`. Pick from the autocomplete list.", ephemeral=True)
+                return
+            selected.append(r)
 
-        # Start from the rulebook baseline, then apply any overrides.
-        sec = rule_obj["seconds"] if seconds is None else seconds
-        pts = rule_obj["points"] if points is None else points
-        ban_val = rule_obj["ban"]
+        # Stack the penalties: sum seconds & points, take the most severe ban.
+        ban_rank = {None: 0, "qualifying": 1, "race": 2}
+        base_sec = sum(r["seconds"] for r in selected)
+        base_pts = sum(r["points"] for r in selected)
+        base_ban = None
+        for r in selected:
+            if ban_rank.get(r["ban"], 0) > ban_rank.get(base_ban, 0):
+                base_ban = r["ban"]
+
+        # Overrides replace the stacked totals.
+        sec = base_sec if seconds is None else seconds
+        pts = base_pts if points is None else points
+        ban_val = base_ban
         if ban is not None:
             ban_val = None if ban.value == "none" else ban.value
 
         # End-of-season scaling (rule 11C)
         scaling_note = ""
         if final_race:
-            base_sec = sec
+            pre = sec
             sec = round(sec * rules.FINAL_RACE_TIME_MULTIPLIER)
-            if base_sec == 0 and pts > 0:
+            if pre == 0 and pts > 0:
                 sec += rules.FINAL_RACE_PP_ONLY_AS_SECONDS
             scaling_note = " (final-race scaling applied per rule 11C)"
 
+        rule_code_str = " + ".join(r["code"] for r in selected)
         division_id = div["id"] if div else None
         previous = database.driver_points(gid, pen_driver["id"], division_id, season)
         database.add_verdict(gid, inc["id"], division_id, season, pen_driver["id"],
-                             rule_obj["code"], sec, pts, ban_val, notes, interaction.user.id)
+                             rule_code_str, sec, pts, ban_val, notes, interaction.user.id)
         database.set_incident_status(inc["id"], "closed")
         # Fold the decision into the consolidated organised-channel case card.
         full = database.get_incident_by_id(gid, inc["id"])
@@ -106,17 +125,19 @@ class Steward(commands.Cog):
         crossed = rules.ban_thresholds_crossed(previous, new_total)
 
         # Build the decision write-up
+        rules_desc = "\n".join(f"**{r['code']} — {r['title']}**" for r in selected)
         embed = discord.Embed(
             title=f"⚖️ Steward decision — Case #{case}",
             color=BRAND,
-            description=f"**{rule_obj['code']} — {rule_obj['title']}**")
+            description=rules_desc)
         embed.add_field(name="Driver", value=driver_label(pen_driver), inline=True)
-        embed.add_field(name="Penalty", value=format_penalty(sec, pts, ban_val) + scaling_note, inline=False)
+        embed.add_field(name="Penalty (combined)", value=format_penalty(sec, pts, ban_val) + scaling_note, inline=False)
         embed.add_field(name="Penalty points",
                         value=f"{previous} → **{new_total}** (Season {season}, {div['name'] if div else 'division'})",
                         inline=False)
-        if rule_obj["variable"] and rule_obj["note"]:
-            embed.add_field(name="Rule note", value=rule_obj["note"], inline=False)
+        rule_notes = [f"`{r['code']}` {r['note']}" for r in selected if r["variable"] and r["note"]]
+        if rule_notes:
+            embed.add_field(name="Rule notes", value="\n".join(rule_notes), inline=False)
         if notes:
             embed.add_field(name="Steward notes", value=notes, inline=False)
         if crossed:
