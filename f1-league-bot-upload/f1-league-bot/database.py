@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS divisions (
     guild_id             TEXT NOT NULL,
     name                 TEXT NOT NULL,
     steward_role_id      TEXT,
+    steward_role_ids     TEXT,
     reports_channel_id   TEXT,
     organised_channel_id TEXT,
     decisions_channel_id TEXT,
@@ -144,6 +145,11 @@ def _migrate(conn):
     div_cols = {r["name"] for r in conn.execute("PRAGMA table_info(divisions)").fetchall()}
     if "organised_channel_id" not in div_cols:
         conn.execute("ALTER TABLE divisions ADD COLUMN organised_channel_id TEXT")
+    if "steward_role_ids" not in div_cols:
+        conn.execute("ALTER TABLE divisions ADD COLUMN steward_role_ids TEXT")
+        # carry existing single steward role into the new list
+        conn.execute("UPDATE divisions SET steward_role_ids = steward_role_id "
+                     "WHERE steward_role_ids IS NULL AND steward_role_id IS NOT NULL")
 
     inc_cols = {r["name"] for r in conn.execute("PRAGMA table_info(incidents)").fetchall()}
     if "organised_channel_id" not in inc_cols:
@@ -178,22 +184,61 @@ def current_season(guild_id) -> int:
 # --------------------------------------------------------------- divisions ---
 def add_division(guild_id, name, steward_role_id, reports_channel_id,
                  organised_channel_id=None, decisions_channel_id=None):
+    role_id = str(steward_role_id) if steward_role_id else None
     with get_conn() as conn:
         cur = conn.execute(
-            "INSERT INTO divisions (guild_id, name, steward_role_id, reports_channel_id, "
-            "organised_channel_id, decisions_channel_id) "
-            "VALUES (?, ?, ?, ?, ?, ?) "
+            "INSERT INTO divisions (guild_id, name, steward_role_id, steward_role_ids, "
+            "reports_channel_id, organised_channel_id, decisions_channel_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(guild_id, name) DO UPDATE SET "
             "steward_role_id=excluded.steward_role_id, "
+            "steward_role_ids=excluded.steward_role_ids, "
             "reports_channel_id=excluded.reports_channel_id, "
             "organised_channel_id=excluded.organised_channel_id, "
             "decisions_channel_id=excluded.decisions_channel_id",
-            (str(guild_id), name, str(steward_role_id) if steward_role_id else None,
+            (str(guild_id), name, role_id, role_id,
              str(reports_channel_id) if reports_channel_id else None,
              str(organised_channel_id) if organised_channel_id else None,
              str(decisions_channel_id) if decisions_channel_id else None),
         )
         return cur.lastrowid
+
+
+def get_steward_role_ids(guild_id, division_id):
+    """Return the list of steward role IDs (as strings) for a division."""
+    div = get_division(guild_id, division_id)
+    if not div:
+        return []
+    try:
+        raw = div["steward_role_ids"]
+    except (KeyError, IndexError):
+        raw = None
+    if raw:
+        return [x for x in raw.split(",") if x]
+    # fall back to the legacy single role if the list is empty
+    return [str(div["steward_role_id"])] if div["steward_role_id"] else []
+
+
+def set_steward_role_ids(guild_id, division_id, ids):
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE divisions SET steward_role_ids=? WHERE guild_id=? AND id=?",
+            (",".join(str(i) for i in ids), str(guild_id), division_id),
+        )
+
+
+def add_steward_role(guild_id, division_id, role_id):
+    ids = get_steward_role_ids(guild_id, division_id)
+    if str(role_id) not in ids:
+        ids.append(str(role_id))
+        set_steward_role_ids(guild_id, division_id, ids)
+    return ids
+
+
+def remove_steward_role(guild_id, division_id, role_id):
+    ids = [i for i in get_steward_role_ids(guild_id, division_id) if i != str(role_id)]
+    set_steward_role_ids(guild_id, division_id, ids)
+    return ids
 
 
 def list_divisions(guild_id):
