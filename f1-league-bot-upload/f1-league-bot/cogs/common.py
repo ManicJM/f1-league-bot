@@ -25,15 +25,27 @@ def resolve_division(interaction):
     return None
 
 
+def division_steward_role_ids(division):
+    """All steward role IDs (strings) configured for a division."""
+    if not division:
+        return set()
+    raw = _row_get(division, "steward_role_ids")
+    ids = set(x for x in raw.split(",") if x) if raw else set()
+    if not ids and _row_get(division, "steward_role_id"):
+        ids.add(str(division["steward_role_id"]))
+    return ids
+
+
 def is_steward_for(interaction, division):
-    """True if the user may act as a steward for this division:
-    they have the division's steward role, or they have manage-guild permission."""
+    """True if the user may act as a steward for this division: they hold ANY of
+    the division's steward roles, or they have manage-guild permission."""
     if interaction.user.guild_permissions.manage_guild:
         return True
-    if division and division["steward_role_id"]:
-        role_ids = {str(r.id) for r in getattr(interaction.user, "roles", [])}
-        return str(division["steward_role_id"]) in role_ids
-    return False
+    steward_ids = division_steward_role_ids(division)
+    if not steward_ids:
+        return False
+    role_ids = {str(r.id) for r in getattr(interaction.user, "roles", [])}
+    return bool(steward_ids & role_ids)
 
 
 def driver_label(driver):
